@@ -93,7 +93,7 @@ pub enum Action {
 }
 
 impl Response {
-    // A response that uses a fixed static string
+    /// A response that uses a fixed static string
     pub const fn fixed(code: u16, message: &'static str) -> Self {
         Self::fixed_action(code, message, Response::action_from_code(code))
     }
