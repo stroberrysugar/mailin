@@ -164,9 +164,9 @@ fn handle_ehlo(
     domain: &str,
 ) -> (Response, Option<Box<dyn State>>) {
     let mut res = handler.helo(fsm.ip, domain);
-    if res.code == 250 {
-        res = fsm.ehlo_response();
-    }
+    //if res.code == 250 {
+    //    res = fsm.ehlo_response();
+    //}
     match fsm.auth_state {
         AuthState::Unavailable => next_state(current, res, || {
             Box::new(Hello {
