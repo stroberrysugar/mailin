@@ -94,7 +94,7 @@ pub enum Action {
 
 impl Response {
     // A response that uses a fixed static string
-    pub(crate) const fn fixed(code: u16, message: &'static str) -> Self {
+    pub const fn fixed(code: u16, message: &'static str) -> Self {
         Self::fixed_action(code, message, Response::action_from_code(code))
     }
 
@@ -106,7 +106,7 @@ impl Response {
     }
 
     // A response that uses a fixed static string and a given action
-    pub(crate) const fn fixed_action(code: u16, message: &'static str, action: Action) -> Self {
+    pub const fn fixed_action(code: u16, message: &'static str, action: Action) -> Self {
         Self {
             code,
             message: Message::Fixed(message),
@@ -126,7 +126,7 @@ impl Response {
     }
 
     // A response that is built dynamically and can be a multiline response
-    pub(crate) fn dynamic(code: u16, head: String, tail: Vec<String>) -> Self {
+    pub fn dynamic(code: u16, head: String, tail: Vec<String>) -> Self {
         Self {
             code,
             message: Message::Dynamic(head, tail),
@@ -136,7 +136,7 @@ impl Response {
     }
 
     // An empty response
-    pub(crate) const fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             code: 0,
             message: Message::Empty,
@@ -177,7 +177,7 @@ impl Response {
     }
 
     // Log the response
-    pub(crate) fn log(&self) {
+    pub fn log(&self) {
         match self.message {
             Message::Empty => (),
             _ => {
