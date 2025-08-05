@@ -105,7 +105,7 @@ impl Response {
         }
     }
 
-    // A response that uses a fixed static string and a given action
+    /// A response that uses a fixed static string and a given action
     pub const fn fixed_action(code: u16, message: &'static str, action: Action) -> Self {
         Self {
             code,
@@ -125,7 +125,7 @@ impl Response {
         }
     }
 
-    // A response that is built dynamically and can be a multiline response
+    /// A response that is built dynamically and can be a multiline response
     pub fn dynamic(code: u16, head: String, tail: Vec<String>) -> Self {
         Self {
             code,
@@ -135,7 +135,7 @@ impl Response {
         }
     }
 
-    // An empty response
+    /// An empty response
     pub const fn empty() -> Self {
         Self {
             code: 0,
@@ -176,7 +176,7 @@ impl Response {
         Ok(buf)
     }
 
-    // Log the response
+    /// Log the response
     pub fn log(&self) {
         match self.message {
             Message::Empty => (),
