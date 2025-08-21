@@ -1,666 +1,286 @@
-use crate::parser::{decode_sasl_login, decode_sasl_plain, parse, parse_auth_response};
+use nom::branch::alt;
+use nom::bytes::complete::{is_not, tag, tag_no_case, take_while, take_while1};
+use nom::character::complete::{space0, space1};
+use nom::character::is_alphanumeric;
+use nom::combinator::{map, map_res, opt, value};
+use nom::sequence::{pair, preceded, separated_pair, terminated};
+use nom::IResult;
+
 use crate::response::*;
+use crate::smtp::{Cmd, Credentials};
+use std::str;
 
-use crate::smtp::Cmd;
-use crate::{AuthMechanism, Handler, Response};
-use either::*;
-use log::{error, trace};
-use std::borrow::BorrowMut;
-use std::net::IpAddr;
-use ternop::ternary;
+//----- Parser -----------------------------------------------------------------
 
-#[cfg(test)]
-#[derive(Debug)]
-pub(crate) enum SmtpState {
-    Invalid,
-    Idle,
-    Hello,
-    HelloAuth,
-    Auth,
-    Mail,
-    Rcpt,
-    Data,
+// Parse a line from the client
+pub fn parse(line: &[u8]) -> Result<Cmd, Response> {
+    command(line).map(|r| r.1).map_err(|e| {
+        println!("Error parsing {}: {:?}", String::from_utf8_lossy(line), e);
+
+        match e {
+            nom::Err::Incomplete(_) => MISSING_PARAMETER,
+            nom::Err::Error(_) => SYNTAX_ERROR,
+            nom::Err::Failure(_) => SYNTAX_ERROR,
+        }
+    })
 }
 
-#[derive(PartialEq)]
-enum TlsState {
-    Unavailable,
-    Inactive,
-    Active,
+// Parse an authentication response from the client
+pub fn parse_auth_response(line: &[u8]) -> Result<&[u8], Response> {
+    auth_response(line).map(|r| r.1).map_err(|_| SYNTAX_ERROR)
 }
 
-enum AuthState {
-    Unavailable,
-    RequiresAuth,
-    Authenticated,
+fn command(buf: &[u8]) -> IResult<&[u8], Cmd> {
+    terminated(
+        alt((
+            helo, ehlo, mail, rcpt, data, rset, quit, vrfy, noop, starttls, auth,
+        )),
+        tag(b"\r\n"),
+    )(buf)
 }
 
-trait State: Send + Sync {
-    #[cfg(test)]
-    fn id(&self) -> SmtpState;
-
-    // Handle an incoming command and return the next state
-    fn handle(
-        self: Box<Self>,
-        fsm: &mut StateMachine,
-        handler: &mut dyn Handler,
-        cmd: Cmd,
-    ) -> (Response, Option<Box<dyn State>>);
-
-    // Most state will convert an input line into a command.
-    // Some states, e.g Data, need to process input lines differently and will
-    // override this method.
-    fn process_line<'a>(
-        &mut self,
-        _handler: &mut dyn Handler,
-        line: &'a [u8],
-    ) -> Either<Cmd<'a>, Response> {
-        trace!("> {}", String::from_utf8_lossy(line));
-        parse(line).map(Left).unwrap_or_else(Right)
-    }
+fn hello_domain(buf: &[u8]) -> IResult<&[u8], &str> {
+    map_res(is_not(b" \t\r\n" as &[u8]), str::from_utf8)(buf)
 }
 
-//------------------------------------------------------------------------------
+fn helo(buf: &[u8]) -> IResult<&[u8], Cmd> {
+    let parse_domain = preceded(cmd(b"helo"), hello_domain);
+    map(parse_domain, |domain| Cmd::Helo { domain })(buf)
+}
 
-// Return the next state depending on the response
-fn next_state<F>(
-    current: Box<dyn State>,
-    res: Response,
-    next_state: F,
-) -> (Response, Option<Box<dyn State>>)
-where
-    F: FnOnce() -> Box<dyn State>,
-{
-    if res.action == Action::Close {
-        (res, None)
-    } else if res.is_error {
-        (res, Some(current))
+fn ehlo(buf: &[u8]) -> IResult<&[u8], Cmd> {
+    let parse_domain = preceded(cmd(b"ehlo"), hello_domain);
+    map(parse_domain, |domain| Cmd::Ehlo { domain })(buf)
+}
+
+fn mail_path(buf: &[u8]) -> IResult<&[u8], &str> {
+    map_res(is_not(b" <>\t\r\n" as &[u8]), str::from_utf8)(buf)
+}
+
+fn take_all(buf: &[u8]) -> IResult<&[u8], &str> {
+    map_res(is_not(b"\r\n" as &[u8]), str::from_utf8)(buf)
+}
+
+fn body_eq_8bit(buf: &[u8]) -> IResult<&[u8], bool> {
+    let preamble = pair(space, tag_no_case(b"body="));
+    let is8bit = alt((
+        value(true, tag_no_case(b"8bitmime")),
+        value(false, tag_no_case(b"7bit")),
+    ));
+    preceded(preamble, is8bit)(buf)
+}
+
+fn is8bitmime(buf: &[u8]) -> IResult<&[u8], bool> {
+    body_eq_8bit(buf).or(Ok((buf, false)))
+}
+
+fn mail(buf: &[u8]) -> IResult<&[u8], Cmd> {
+    // Allow zero-or-more spaces between MAIL and FROM:
+    let preamble = pair(cmd(b"mail"), preceded(space0, tag_no_case(b"from:<")));
+
+    let mail_path_parser = preceded(preamble, mail_path);
+    let core = terminated(mail_path_parser, tag(b">"));
+
+    // Optional params: require a space if present, run until CR or LF
+    let params_parser = opt(preceded(space1, take_while(|b| b != b'\r' && b != b'\n')));
+
+    map(pair(core, params_parser), |(reverse_path, params_opt)| {
+        let params = params_opt.unwrap_or(&[][..]);
+
+        // BODY=8BITMIME detection across tokens, case-insensitive
+        let is8bit = params
+            .split(|&b| b == b' ' || b == b'\t')
+            .any(|tok| tok.eq_ignore_ascii_case(b"BODY=8BITMIME"));
+
+        Cmd::Mail {
+            reverse_path,
+            is8bit,
+        }
+    })(buf)
+}
+
+fn rcpt(buf: &[u8]) -> IResult<&[u8], Cmd> {
+    let preamble = pair(cmd(b"rcpt"), tag_no_case(b"to:<"));
+    let mail_path_parser = preceded(preamble, mail_path);
+    let parser = terminated(mail_path_parser, tag(b">"));
+    map(parser, |path| Cmd::Rcpt { forward_path: path })(buf)
+}
+
+fn data(buf: &[u8]) -> IResult<&[u8], Cmd> {
+    value(Cmd::Data, tag_no_case(b"data"))(buf)
+}
+
+fn rset(buf: &[u8]) -> IResult<&[u8], Cmd> {
+    value(Cmd::Rset, tag_no_case(b"rset"))(buf)
+}
+
+fn quit(buf: &[u8]) -> IResult<&[u8], Cmd> {
+    value(Cmd::Quit, tag_no_case(b"quit"))(buf)
+}
+
+fn vrfy(buf: &[u8]) -> IResult<&[u8], Cmd> {
+    let preamble = preceded(cmd(b"vrfy"), take_all);
+    value(Cmd::Vrfy, preamble)(buf)
+}
+
+fn noop(buf: &[u8]) -> IResult<&[u8], Cmd> {
+    value(Cmd::Noop, tag_no_case(b"noop"))(buf)
+}
+
+fn starttls(buf: &[u8]) -> IResult<&[u8], Cmd> {
+    value(Cmd::StartTls, tag_no_case(b"starttls"))(buf)
+}
+
+fn is_base64(chr: u8) -> bool {
+    is_alphanumeric(chr) || (chr == b'+') || (chr == b'/' || chr == b'=')
+}
+
+fn auth_initial(buf: &[u8]) -> IResult<&[u8], &[u8]> {
+    preceded(space, take_while1(is_base64))(buf)
+}
+
+fn auth_response(buf: &[u8]) -> IResult<&[u8], &[u8]> {
+    terminated(take_while1(is_base64), tag("\r\n"))(buf)
+}
+
+fn empty(buf: &[u8]) -> IResult<&[u8], &[u8]> {
+    Ok((buf, b"" as &[u8]))
+}
+
+fn auth_plain(buf: &[u8]) -> IResult<&[u8], Cmd> {
+    let parser = preceded(tag_no_case(b"plain"), alt((auth_initial, empty)));
+    map(parser, sasl_plain_cmd)(buf)
+}
+
+fn auth_login(buf: &[u8]) -> IResult<&[u8], Cmd> {
+    let parser = preceded(tag_no_case(b"login"), alt((auth_initial, empty)));
+    map(parser, sasl_login_cmd)(buf)
+}
+
+fn auth(buf: &[u8]) -> IResult<&[u8], Cmd> {
+    preceded(cmd(b"auth"), alt((auth_plain, auth_login)))(buf)
+}
+
+//---- Helper functions ---------------------------------------------------------
+
+// Return a parser to match the given command
+fn cmd(cmd_tag: &[u8]) -> impl Fn(&[u8]) -> IResult<&[u8], (&[u8], &[u8])> + '_ {
+    move |buf: &[u8]| pair(tag_no_case(cmd_tag), space)(buf)
+}
+
+// Match one or more spaces
+fn space(buf: &[u8]) -> IResult<&[u8], &[u8]> {
+    take_while1(|b| b == b' ')(buf)
+}
+
+fn sasl_plain_cmd(param: &[u8]) -> Cmd {
+    if param.is_empty() {
+        Cmd::AuthPlainEmpty
     } else {
-        (res, Some(next_state()))
+        let creds = decode_sasl_plain(param);
+        Cmd::AuthPlain {
+            authorization_id: creds.authorization_id,
+            authentication_id: creds.authentication_id,
+            password: creds.password,
+        }
     }
 }
 
-// Convert the current state to the next state depending on the response
-fn transform_state<S, F>(
-    current: Box<S>,
-    res: Response,
-    next_state: F,
-) -> (Response, Option<Box<dyn State>>)
-where
-    S: State + 'static,
-    F: FnOnce(S) -> Box<dyn State>,
-{
-    if res.action == Action::Close {
-        (res, None)
-    } else if res.is_error {
-        (res, Some(current))
+fn sasl_login_cmd(param: &[u8]) -> Cmd {
+    if param.is_empty() {
+        Cmd::AuthLoginEmpty
     } else {
-        (res, Some(next_state(*current)))
-    }
-}
-
-fn default_handler(
-    current: Box<dyn State>,
-    fsm: &StateMachine,
-    handler: &mut dyn Handler,
-    cmd: &Cmd,
-) -> (Response, Option<Box<dyn State>>) {
-    match *cmd {
-        Cmd::Quit => (GOODBYE, None),
-        Cmd::Helo { domain } => handle_helo(current, fsm, handler, domain),
-        Cmd::Ehlo { domain } => handle_ehlo(current, fsm, handler, domain),
-        Cmd::Noop => (OK, Some(current)),
-        _ => unhandled(current),
-    }
-}
-
-fn unhandled(current: Box<dyn State>) -> (Response, Option<Box<dyn State>>) {
-    (BAD_SEQUENCE_COMMANDS, Some(current))
-}
-
-fn handle_rset(fsm: &StateMachine, domain: &str) -> (Response, Option<Box<dyn State>>) {
-    match fsm.auth_state {
-        AuthState::Unavailable => (
-            OK,
-            Some(Box::new(Hello {
-                domain: domain.to_string(),
-            })),
-        ),
-        _ => (
-            OK,
-            Some(Box::new(HelloAuth {
-                domain: domain.to_string(),
-            })),
-        ),
-    }
-}
-
-fn handle_helo(
-    current: Box<dyn State>,
-    fsm: &StateMachine,
-    handler: &mut dyn Handler,
-    domain: &str,
-) -> (Response, Option<Box<dyn State>>) {
-    match fsm.auth_state {
-        AuthState::Unavailable => {
-            let res = handler.helo(fsm.ip, domain);
-            next_state(current, res, || {
-                Box::new(Hello {
-                    domain: domain.to_owned(),
-                })
-            })
-        }
-        _ => {
-            // If authentication is required the client should be using EHLO
-            (BAD_HELLO, Some(current))
+        Cmd::AuthLogin {
+            username: decode_sasl_login(param),
         }
     }
 }
 
-fn handle_ehlo(
-    current: Box<dyn State>,
-    fsm: &StateMachine,
-    handler: &mut dyn Handler,
-    domain: &str,
-) -> (Response, Option<Box<dyn State>>) {
-    let mut res = handler.helo(fsm.ip, domain);
-    //if res.code == 250 {
-    //    res = fsm.ehlo_response();
-    //}
-    match fsm.auth_state {
-        AuthState::Unavailable => next_state(current, res, || {
-            Box::new(Hello {
-                domain: domain.to_owned(),
-            })
-        }),
-        AuthState::RequiresAuth | AuthState::Authenticated => next_state(current, res, || {
-            Box::new(HelloAuth {
-                domain: domain.to_owned(),
-            })
-        }),
-    }
-}
-
-fn authenticate_plain(
-    fsm: &mut StateMachine,
-    handler: &mut dyn Handler,
-    authorization_id: &str,
-    authentication_id: &str,
-    password: &str,
-) -> Response {
-    let auth_res = handler.auth_plain(authorization_id, authentication_id, password);
-    fsm.auth_state = ternary!(
-        auth_res.code == 235,
-        AuthState::Authenticated,
-        AuthState::RequiresAuth
-    );
-    auth_res
-}
-
-fn authenticate_login(
-    fsm: &mut StateMachine,
-    handler: &mut dyn Handler,
-    username: &str,
-    password: &str,
-) -> Response {
-    let auth_res = handler.auth_login(username, password);
-    fsm.auth_state = ternary!(
-        auth_res.code == 235,
-        AuthState::Authenticated,
-        AuthState::RequiresAuth
-    );
-    auth_res
-}
-
-//------------------------------------------------------------------------------
-
-struct Idle {}
-
-impl State for Idle {
-    #[cfg(test)]
-    fn id(&self) -> SmtpState {
-        SmtpState::Idle
-    }
-
-    fn handle(
-        self: Box<Self>,
-        fsm: &mut StateMachine,
-        handler: &mut dyn Handler,
-        cmd: Cmd,
-    ) -> (Response, Option<Box<dyn State>>) {
-        match cmd {
-            Cmd::StartedTls => {
-                fsm.tls = TlsState::Active;
-                (EMPTY_RESPONSE, Some(self))
-            }
-            Cmd::Rset => (OK, Some(self)),
-            _ => default_handler(self, fsm, handler, &cmd),
+// Decodes the base64 encoded plain authentication parameter
+pub(crate) fn decode_sasl_plain(param: &[u8]) -> Credentials {
+    let decoded = base64::decode(param);
+    if let Ok(bytes) = decoded {
+        let mut fields = bytes.split(|b| b == &0u8);
+        let authorization_id = next_string(&mut fields);
+        let authentication_id = next_string(&mut fields);
+        let password = next_string(&mut fields);
+        Credentials {
+            authorization_id,
+            authentication_id,
+            password,
+        }
+    } else {
+        Credentials {
+            authorization_id: String::default(),
+            authentication_id: String::default(),
+            password: String::default(),
         }
     }
 }
 
-//------------------------------------------------------------------------------
-
-struct Hello {
-    domain: String,
+// Decodes base64 encoded login authentication parameters (in login auth, username and password are
+// sent in separate lines)
+pub(crate) fn decode_sasl_login(param: &[u8]) -> String {
+    let decoded = base64::decode(param).unwrap_or_default();
+    String::from_utf8(decoded).unwrap_or_default()
 }
 
-impl State for Hello {
-    #[cfg(test)]
-    fn id(&self) -> SmtpState {
-        SmtpState::Hello
-    }
+fn next_string(it: &mut dyn Iterator<Item = &[u8]>) -> String {
+    it.next()
+        .map(|s| str::from_utf8(s).unwrap_or_default())
+        .unwrap_or_default()
+        .to_owned()
+}
 
-    fn handle(
-        self: Box<Self>,
-        fsm: &mut StateMachine,
-        handler: &mut dyn Handler,
-        cmd: Cmd,
-    ) -> (Response, Option<Box<dyn State>>) {
-        match cmd {
-            Cmd::Mail {
-                reverse_path,
-                is8bit,
-            } => {
-                let res = handler.mail(fsm.ip, &self.domain, reverse_path);
-                transform_state(self, res, |s| {
-                    Box::new(Mail {
-                        domain: s.domain,
-                        reverse_path: reverse_path.to_owned(),
-                        is8bit,
-                    })
-                })
+//---- Tests --------------------------------------------------------------------
+
+mod tests {
+    #[allow(unused_imports)]
+    use super::*;
+
+    #[test]
+    fn auth_initial_plain() {
+        let res = parse(b"auth plain dGVzdAB0ZXN0ADEyMzQ=\r\n");
+        match res {
+            Ok(Cmd::AuthPlain {
+                authorization_id,
+                authentication_id,
+                password,
+            }) => {
+                assert_eq!(authorization_id, "test");
+                assert_eq!(authentication_id, "test");
+                assert_eq!(password, "1234");
             }
-            Cmd::StartTls if fsm.tls == TlsState::Inactive => (START_TLS, Some(Box::new(Idle {}))),
-            Cmd::Vrfy => (VERIFY_RESPONSE, Some(self)),
-            Cmd::Rset => handle_rset(fsm, &self.domain),
-            _ => default_handler(self, fsm, handler, &cmd),
-        }
-    }
-}
-
-//------------------------------------------------------------------------------
-
-struct HelloAuth {
-    domain: String,
-}
-
-impl State for HelloAuth {
-    #[cfg(test)]
-    fn id(&self) -> SmtpState {
-        SmtpState::HelloAuth
-    }
-
-    fn handle(
-        self: Box<Self>,
-        fsm: &mut StateMachine,
-        handler: &mut dyn Handler,
-        cmd: Cmd,
-    ) -> (Response, Option<Box<dyn State>>) {
-        match cmd {
-            Cmd::StartTls => (START_TLS, Some(Box::new(Idle {}))),
-            Cmd::AuthPlain {
-                ref authorization_id,
-                ref authentication_id,
-                ref password,
-            } if fsm.allow_auth_plain() => {
-                let res =
-                    authenticate_plain(fsm, handler, authorization_id, authentication_id, password);
-                transform_state(self, res, |s| Box::new(Hello { domain: s.domain }))
-            }
-            Cmd::AuthPlainEmpty if fsm.allow_auth_plain() => {
-                let domain = self.domain.clone();
-                (
-                    EMPTY_AUTH_CHALLENGE,
-                    Some(Box::new(Auth {
-                        domain,
-                        mechanism: AuthMechanism::Plain,
-                        username: None,
-                    })),
-                )
-            }
-            Cmd::AuthLogin { ref username } if fsm.allow_auth_login() => {
-                let domain = self.domain.clone();
-                (
-                    PASSWORD_AUTH_CHALLENGE,
-                    Some(Box::new(Auth {
-                        domain,
-                        mechanism: AuthMechanism::Login,
-                        username: Some(username.clone()),
-                    })),
-                )
-            }
-            Cmd::AuthLoginEmpty if fsm.allow_auth_login() => {
-                let domain = self.domain.clone();
-                (
-                    USERNAME_AUTH_CHALLENGE,
-                    Some(Box::new(Auth {
-                        domain,
-                        mechanism: AuthMechanism::Login,
-                        username: None,
-                    })),
-                )
-            }
-            Cmd::Rset => handle_rset(fsm, &self.domain),
-            _ => default_handler(self, fsm, handler, &cmd),
-        }
-    }
-}
-
-//------------------------------------------------------------------------------
-
-struct Auth {
-    domain: String,
-    mechanism: AuthMechanism,
-    username: Option<String>,
-}
-
-impl State for Auth {
-    #[cfg(test)]
-    fn id(&self) -> SmtpState {
-        SmtpState::Auth
-    }
-
-    fn handle(
-        mut self: Box<Self>,
-        fsm: &mut StateMachine,
-        handler: &mut dyn Handler,
-        cmd: Cmd,
-    ) -> (Response, Option<Box<dyn State>>) {
-        match cmd {
-            Cmd::AuthResponse { response } => match self.mechanism {
-                AuthMechanism::Plain => {
-                    let creds = decode_sasl_plain(response);
-                    let res = authenticate_plain(
-                        fsm,
-                        handler,
-                        &creds.authorization_id,
-                        &creds.authentication_id,
-                        &creds.password,
-                    );
-                    if res.is_error {
-                        (
-                            res,
-                            Some(Box::new(HelloAuth {
-                                domain: self.domain,
-                            })),
-                        )
-                    } else {
-                        (
-                            res,
-                            Some(Box::new(Hello {
-                                domain: self.domain,
-                            })),
-                        )
-                    }
-                }
-                AuthMechanism::Login => {
-                    let credential = decode_sasl_login(response);
-                    if let Some(username) = self.username {
-                        let res = authenticate_login(fsm, handler, &username, &credential);
-                        let domain = self.domain.clone();
-                        if res.is_error {
-                            (res, Some(Box::new(HelloAuth { domain })))
-                        } else {
-                            (res, Some(Box::new(Hello { domain })))
-                        }
-                    } else {
-                        self.username = Some(credential);
-                        (PASSWORD_AUTH_CHALLENGE, Some(self))
-                    }
-                }
-            },
-            _ => unhandled(self),
-        }
-    }
-
-    fn process_line<'a>(
-        &mut self,
-        _handler: &mut dyn Handler,
-        line: &'a [u8],
-    ) -> Either<Cmd<'a>, Response> {
-        trace!("> {}", String::from_utf8_lossy(line));
-        parse_auth_response(line)
-            .map(|r| Left(Cmd::AuthResponse { response: r }))
-            .unwrap_or_else(Right)
-    }
-}
-
-//------------------------------------------------------------------------------
-
-struct Mail {
-    domain: String,
-    reverse_path: String,
-    is8bit: bool,
-}
-
-impl State for Mail {
-    #[cfg(test)]
-    fn id(&self) -> SmtpState {
-        SmtpState::Mail
-    }
-
-    fn handle(
-        self: Box<Self>,
-        fsm: &mut StateMachine,
-        handler: &mut dyn Handler,
-        cmd: Cmd,
-    ) -> (Response, Option<Box<dyn State>>) {
-        match cmd {
-            Cmd::Rcpt { forward_path } => {
-                let res = handler.rcpt(forward_path);
-                transform_state(self, res, |s| {
-                    let fp = vec![forward_path.to_owned()];
-                    Box::new(Rcpt {
-                        domain: s.domain,
-                        reverse_path: s.reverse_path,
-                        is8bit: s.is8bit,
-                        forward_path: fp,
-                    })
-                })
-            }
-            Cmd::Rset => handle_rset(fsm, &self.domain),
-            _ => default_handler(self, fsm, handler, &cmd),
-        }
-    }
-}
-
-//------------------------------------------------------------------------------
-
-struct Rcpt {
-    domain: String,
-    reverse_path: String,
-    is8bit: bool,
-    forward_path: Vec<String>,
-}
-
-impl State for Rcpt {
-    #[cfg(test)]
-    fn id(&self) -> SmtpState {
-        SmtpState::Rcpt
-    }
-
-    fn handle(
-        self: Box<Self>,
-        fsm: &mut StateMachine,
-        handler: &mut dyn Handler,
-        cmd: Cmd,
-    ) -> (Response, Option<Box<dyn State>>) {
-        match cmd {
-            Cmd::Data => {
-                let res = handler.data_start(
-                    &self.domain,
-                    &self.reverse_path,
-                    self.is8bit,
-                    &self.forward_path,
-                );
-                let res = ternary!(res.is_error, res, START_DATA);
-                transform_state(self, res, |s| Box::new(Data { domain: s.domain }))
-            }
-            Cmd::Rcpt { forward_path } => {
-                let res = handler.rcpt(forward_path);
-                transform_state(self, res, |s| {
-                    let mut fp = s.forward_path;
-                    fp.push(forward_path.to_owned());
-                    Box::new(Rcpt {
-                        domain: s.domain,
-                        reverse_path: s.reverse_path,
-                        is8bit: s.is8bit,
-                        forward_path: fp,
-                    })
-                })
-            }
-            Cmd::Rset => handle_rset(fsm, &self.domain),
-            _ => default_handler(self, fsm, handler, &cmd),
-        }
-    }
-}
-
-//------------------------------------------------------------------------------
-
-struct Data {
-    domain: String,
-}
-
-impl State for Data {
-    #[cfg(test)]
-    fn id(&self) -> SmtpState {
-        SmtpState::Data
-    }
-
-    fn handle(
-        self: Box<Self>,
-        _fsm: &mut StateMachine,
-        handler: &mut dyn Handler,
-        cmd: Cmd,
-    ) -> (Response, Option<Box<dyn State>>) {
-        match cmd {
-            Cmd::DataEnd => {
-                let res = handler.data_end();
-                transform_state(self, res, |s| Box::new(Hello { domain: s.domain }))
-            }
-            _ => unhandled(self),
-        }
-    }
-
-    fn process_line<'a>(
-        &mut self,
-        handler: &mut dyn Handler,
-        mut line: &'a [u8],
-    ) -> Either<Cmd<'a>, Response> {
-        if line == b".\r\n" {
-            trace!("> _data_");
-            Left(Cmd::DataEnd)
-        } else {
-            if line.starts_with(b".") {
-                line = &line[1..];
-            }
-            match handler.data(line) {
-                Ok(_) => Right(EMPTY_RESPONSE),
-                Err(e) => {
-                    error!("Error saving message: {}", e);
-                    Right(TRANSACTION_FAILED)
-                }
-            }
-        }
-    }
-}
-//------------------------------------------------------------------------------
-
-pub(crate) struct StateMachine {
-    ip: IpAddr,
-    auth_mechanisms: Vec<AuthMechanism>,
-    auth_state: AuthState,
-    tls: TlsState,
-    smtp: Option<Box<dyn State>>,
-    auth_plain: bool,
-    auth_login: bool,
-    insecure_allow_plaintext_auth: bool,
-}
-
-impl StateMachine {
-    pub fn new(
-        ip: IpAddr,
-        auth_mechanisms: Vec<AuthMechanism>,
-        allow_start_tls: bool,
-        insecure_allow_plaintext_auth: bool,
-    ) -> Self {
-        let auth_state = ternary!(
-            auth_mechanisms.is_empty(),
-            AuthState::Unavailable,
-            AuthState::RequiresAuth
-        );
-        let tls = ternary!(allow_start_tls, TlsState::Inactive, TlsState::Unavailable);
-        let auth_plain = auth_mechanisms.contains(&AuthMechanism::Plain);
-        let auth_login = auth_mechanisms.contains(&AuthMechanism::Login);
-        Self {
-            ip,
-            auth_mechanisms,
-            auth_state,
-            tls,
-            smtp: Some(Box::new(Idle {})),
-            auth_plain,
-            auth_login,
-            insecure_allow_plaintext_auth,
-        }
-    }
-
-    // Respond and change state with the given command
-    pub fn command(&mut self, handler: &mut dyn Handler, cmd: Cmd) -> Response {
-        let (response, next_state) = match self.smtp.take() {
-            Some(last_state) => last_state.handle(self, handler, cmd),
-            None => (INVALID_STATE, None),
+            _ => panic!("Auth plain with initial response incorrectly parsed"),
         };
-        self.smtp = next_state;
-        response
     }
 
-    pub fn process_line<'a>(
-        &mut self,
-        handler: &mut dyn Handler,
-        line: &'a [u8],
-    ) -> Either<Cmd<'a>, Response> {
-        match self.smtp {
-            Some(ref mut s) => {
-                let s: &mut dyn State = s.borrow_mut();
-                s.process_line(handler, line)
+    #[test]
+    fn auth_initial_login() {
+        let res = parse(b"auth login ZHVtbXk=\r\n");
+        match res {
+            Ok(Cmd::AuthLogin { username }) => {
+                assert_eq!(username, "dummy");
             }
-            None => Right(INVALID_STATE),
-        }
+            _ => panic!("Auth login with initial response incorrectly parsed"),
+        };
     }
 
-    #[cfg(test)]
-    pub fn current_state(&self) -> SmtpState {
-        let id = self.smtp.as_ref().map(|s| s.id());
-        id.unwrap_or(SmtpState::Invalid)
+    #[test]
+    fn auth_empty_plain() {
+        let res = parse(b"auth plain\r\n");
+        match res {
+            Ok(Cmd::AuthPlainEmpty) => {}
+            _ => panic!("Auth plain without initial response incorrectly parsed"),
+        };
     }
 
-    fn ehlo_response(&self) -> Response {
-        let mut extensions = vec!["8BITMIME".to_string()];
-        if self.tls == TlsState::Inactive {
-            extensions.push("STARTTLS".to_string());
-        }
-
-        if self.allow_auth() && !self.auth_mechanisms.is_empty() {
-            let mut auth_available = "AUTH".to_string();
-            for auth in &self.auth_mechanisms {
-                auth_available += " ";
-                auth_available += auth.extension();
-            }
-            extensions.push(auth_available);
-        }
-        Response::dynamic(250, "server offers extensions:".to_string(), extensions)
-    }
-
-    fn allow_auth_plain(&self) -> bool {
-        self.auth_plain && self.allow_auth()
-    }
-
-    fn allow_auth_login(&self) -> bool {
-        self.auth_login && self.allow_auth()
-    }
-
-    fn allow_auth(&self) -> bool {
-        self.insecure_allow_plaintext_auth || (self.tls == TlsState::Active)
+    #[test]
+    fn auth_empty_login() {
+        let res = parse(b"auth login\r\n");
+        match res {
+            Ok(Cmd::AuthLoginEmpty) => {}
+            _ => panic!("Auth login without initial response incorrectly parsed"),
+        };
     }
 }
