@@ -1,7 +1,8 @@
 use nom::branch::alt;
-use nom::bytes::complete::{is_not, tag, tag_no_case, take_while1};
+use nom::bytes::complete::{is_not, tag, tag_no_case, take_while, take_while1};
+use nom::character::complete::{space0, space1};
 use nom::character::is_alphanumeric;
-use nom::combinator::{map, map_res, value};
+use nom::combinator::{map, map_res, opt, value};
 use nom::sequence::{pair, preceded, separated_pair, terminated};
 use nom::IResult;
 
@@ -13,10 +14,14 @@ use std::str;
 
 // Parse a line from the client
 pub fn parse(line: &[u8]) -> Result<Cmd, Response> {
-    command(line).map(|r| r.1).map_err(|e| match e {
-        nom::Err::Incomplete(_) => MISSING_PARAMETER,
-        nom::Err::Error(_) => SYNTAX_ERROR,
-        nom::Err::Failure(_) => SYNTAX_ERROR,
+    command(line).map(|r| r.1).map_err(|e| {
+        println!("Error parsing {}: {:?}", String::from_utf8_lossy(line), e);
+
+        match e {
+            nom::Err::Incomplete(_) => MISSING_PARAMETER,
+            nom::Err::Error(_) => SYNTAX_ERROR,
+            nom::Err::Failure(_) => SYNTAX_ERROR,
+        }
     })
 }
 
@@ -70,12 +75,27 @@ fn is8bitmime(buf: &[u8]) -> IResult<&[u8], bool> {
 }
 
 fn mail(buf: &[u8]) -> IResult<&[u8], Cmd> {
-    let preamble = pair(cmd(b"mail"), tag_no_case(b"from:<"));
+    // Allow zero-or-more spaces between MAIL and FROM:
+    let preamble = pair(cmd(b"mail"), preceded(space0, tag_no_case(b"from:<")));
+
     let mail_path_parser = preceded(preamble, mail_path);
-    let parser = separated_pair(mail_path_parser, tag(b">"), is8bitmime);
-    map(parser, |r| Cmd::Mail {
-        reverse_path: r.0,
-        is8bit: r.1,
+    let core = terminated(mail_path_parser, tag(b">"));
+
+    // Optional params: require a space if present, run until CR or LF
+    let params_parser = opt(preceded(space1, take_while(|b| b != b'\r' && b != b'\n')));
+
+    map(pair(core, params_parser), |(reverse_path, params_opt)| {
+        let params = params_opt.unwrap_or(&[][..]);
+
+        // BODY=8BITMIME detection across tokens, case-insensitive
+        let is8bit = params
+            .split(|&b| b == b' ' || b == b'\t')
+            .any(|tok| tok.eq_ignore_ascii_case(b"BODY=8BITMIME"));
+
+        Cmd::Mail {
+            reverse_path,
+            is8bit,
+        }
     })(buf)
 }
 
